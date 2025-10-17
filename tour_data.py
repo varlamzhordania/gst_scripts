@@ -94,7 +94,7 @@ SHEET_MAPPINGS = {
             "Profile image*": "image"
         },
     },
-    "transports suplier": {
+    "Transport suppliers": {
         "table": "supplier",
         "columns": {
             "Supplier Name": "name",
@@ -106,7 +106,7 @@ SHEET_MAPPINGS = {
             "Profile image": "image"
         }
     },
-    "transports cost": {
+    "Transport costs": {
         "table": "transport_cost",
         "columns": {
             "Route name*": "route_name",
@@ -194,6 +194,7 @@ SHEET_MAPPINGS = {
             "Tour notes": "notes",
             "Category": "category",  # optional if you have categories
             "flights": "flights",
+            "flights repeat": "flights_repeat",
             "Sights": "sights",
             "Transport routes": "transport"
         },
@@ -246,7 +247,16 @@ SHEET_MAPPINGS = {
                 "sep": ",",
                 "fk_return_type": "csv"
             },
-        }
+        },
+        "repeat_logic": {
+            "trigger_column": "flights_repeat",
+            "trigger_value": "yes",
+            "repeat_source": {
+                "table": "airline_ticket",
+                "lookup_column": "ticket_title",
+                "match_column": "flights",
+            }
+        },
     },
     "GTI itineraries": {
         "table": "gti_itinerary",
@@ -321,6 +331,62 @@ def to_int_flag(value):
     if isinstance(value, (int, float)):
         return int(value)
     return 0
+
+
+def clean_row(row):
+    import math
+
+    cleaned = []
+    for v in row:
+        if v is None or (isinstance(v, float) and math.isnan(v)) or str(
+                v
+        ).strip().lower() in ['nan', 'none', '']:
+            cleaned.append(None)
+        else:
+            cleaned.append(v)
+    return cleaned
+
+
+def expand_repeat_rows(df, mapping, cursor):
+    """
+    General mechanism to repeat rows based on mapping['repeat_logic'].
+    Returns a new DataFrame with repeated rows added.
+    """
+    repeat_cfg = mapping.get("repeat_logic")
+    if not repeat_cfg:
+        return df  # nothing to do
+
+    trigger_col = repeat_cfg["trigger_column"]
+    trigger_val = repeat_cfg.get("trigger_value", "yes").lower()
+    repeat_src = repeat_cfg["repeat_source"]
+
+    expanded_rows = []
+
+    for _, row in df.iterrows():
+        trigger = str(row.get(trigger_col, "")).strip().lower()
+        if trigger != trigger_val:
+            expanded_rows.append(row)
+            continue
+
+        # Get repeat count from lookup table
+        match_value = row.get(repeat_src["match_column"])
+        cursor.execute(
+            f"SELECT COUNT(*) FROM {repeat_src['table']} WHERE {repeat_src['lookup_column']} = %s",
+            (match_value,)
+        )
+        count = cursor.fetchone()[0] or 0
+
+        if count > 0:
+            for _ in range(count):
+                expanded_rows.append(row.copy())
+        else:
+            expanded_rows.append(row)
+
+    new_df = pd.DataFrame(expanded_rows)
+    print(
+        f"Expanded {len(new_df) - len(df)} extra rows via repeat_logic in {mapping['table']}"
+    )
+    return new_df
 
 
 def resolve_fk(
@@ -485,6 +551,9 @@ def import_sheet(sheet_name, df, cursor, db):
     df = df.rename(columns=lambda x: x.strip())
     df = df.where(pd.notnull(df), None)
 
+    # Expand rows based on repeat_logic if defined
+    df = expand_repeat_rows(df, mapping, cursor)
+
     # Convert int/flag columns
     if table in INT_COLUMNS:
         for col in INT_COLUMNS[table]:
@@ -588,13 +657,30 @@ def import_sheet(sheet_name, df, cursor, db):
 
 
 def load_excel_sheets(file_path):
-    """Return a dict of sheet_name -> DataFrame"""
+    """Return a dict of cleaned sheet_name -> cleaned DataFrame"""
     all_sheets = pd.read_excel(file_path, sheet_name=None)
     cleaned_sheets = {}
+
     for sheet_name, df in all_sheets.items():
         clean_name = sheet_name.strip()  # remove trailing spaces
-        df.columns = df.columns.str.strip()  # remove spaces in headers
-        cleaned_sheets[clean_name] = df
+
+        # Clean column headers
+        df.columns = df.columns.astype(str).str.strip()
+
+        # Drop rows that are fully empty
+        df.dropna(how='all', inplace=True)
+
+        # Modern replacement for applymap: apply Series.map to each column
+        for col in df.columns:
+            df[col] = df[col].map(
+                lambda x: None if pd.isna(x) or str(x).strip().lower() in (
+                'nan', 'none', '') else x
+            )
+
+        # Only include if the sheet has any data left
+        if not df.empty:
+            cleaned_sheets[clean_name] = df
+
     return cleaned_sheets
 
 
