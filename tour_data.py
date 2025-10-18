@@ -3,6 +3,8 @@ import json
 import pandas as pd
 import mysql.connector
 
+FK_CACHE = {}
+
 DB_HOST = 'localhost'
 DB_USER = 'root'
 DB_PASS = '<PASSWORD>'
@@ -225,7 +227,7 @@ SHEET_MAPPINGS = {
             },
             "flights": {
                 "lookup_table": "airline_ticket",
-                "lookup_column": "ticket_title",
+                "lookup_column": "id",
                 "target_column": "id",
                 "multi": True,
                 "sep": ",",
@@ -349,43 +351,46 @@ def clean_row(row):
 
 def expand_repeat_rows(df, mapping, cursor):
     """
-    General mechanism to repeat rows based on mapping['repeat_logic'].
-    Returns a new DataFrame with repeated rows added.
+    Improved repeat logic:
+    - Instead of duplicating rows, attach related FK IDs to a new field
+    - Prevents phantom rows while keeping all flight relationships
     """
     repeat_cfg = mapping.get("repeat_logic")
     if not repeat_cfg:
-        return df  # nothing to do
+        return df
 
     trigger_col = repeat_cfg["trigger_column"]
     trigger_val = repeat_cfg.get("trigger_value", "yes").lower()
     repeat_src = repeat_cfg["repeat_source"]
 
-    expanded_rows = []
+    new_rows = []
 
     for _, row in df.iterrows():
         trigger = str(row.get(trigger_col, "")).strip().lower()
-        if trigger != trigger_val:
-            expanded_rows.append(row)
+        match_value = row.get(repeat_src["match_column"])
+        if trigger != trigger_val or not match_value:
+            new_rows.append(row)
             continue
 
-        # Get repeat count from lookup table
-        match_value = row.get(repeat_src["match_column"])
+        # fetch all IDs instead of count
         cursor.execute(
-            f"SELECT COUNT(*) FROM {repeat_src['table']} WHERE {repeat_src['lookup_column']} = %s",
+            f"SELECT id FROM {repeat_src['table']} WHERE {repeat_src['lookup_column']} = %s",
             (match_value,)
         )
-        count = cursor.fetchone()[0] or 0
+        ids = [r[0] for r in cursor.fetchall()]
 
-        if count > 0:
-            for _ in range(count):
-                expanded_rows.append(row.copy())
+        # if found, store as CSV of flight IDs
+        if ids:
+            row_copy = row.copy()
+            row_copy["flights"] = ",".join(map(str, ids))
+            new_rows.append(row_copy)
         else:
-            expanded_rows.append(row)
+            new_rows.append(row)
 
-    new_df = pd.DataFrame(expanded_rows)
+    new_df = pd.DataFrame(new_rows)
     print(
-        f"Expanded {len(new_df) - len(df)} extra rows via repeat_logic in {mapping['table']}"
-    )
+        f"Processed repeat_logic for {mapping['table']}: merged related flight IDs (no row expansion)."
+        )
     return new_df
 
 
@@ -398,14 +403,10 @@ def resolve_fk(
         multi=False,
         sep=",",
         return_type="json_array"
-        # options: "csv", "json_array", "nested_array"
 ):
     """
-    Resolve a foreign key or list of foreign keys.
-    return_type controls the format:
-      - "csv": 1,2,3
-      - "json_array": [1,2,3]
-      - "nested_array": [["1",0],["2",1],["3",2]]
+    Resolve a foreign key or list of foreign keys with caching for performance.
+    Supports multiple matches (fetchall) for multi=True.
     """
     if not value:
         return None
@@ -416,17 +417,25 @@ def resolve_fk(
             v = v.strip()
             if not v:
                 continue
-            cursor.execute(
-                f"SELECT {target_column} FROM {lookup_table} WHERE {lookup_column} = %s",
-                (v,)
-            )
-            result = cursor.fetchone()
-            if result:
-                ids.append(result[0])
+            key = (lookup_table, lookup_column, v)
+
+            # Cache check
+            if key in FK_CACHE:
+                results = FK_CACHE[key]
+            else:
+                cursor.execute(
+                    f"SELECT {target_column} FROM {lookup_table} WHERE {lookup_column} = %s",
+                    (v,)
+                )
+                results = cursor.fetchall()
+                FK_CACHE[key] = results
+
+            if results:
+                ids.extend([r[0] for r in results])
             else:
                 print(
                     f"⚠️ FK not found: '{v}' in {lookup_table}.{lookup_column}"
-                )
+                    )
 
         if not ids:
             return None
@@ -436,20 +445,23 @@ def resolve_fk(
         elif return_type == "json_array":
             return json.dumps(ids)
         elif return_type == "nested_array":
-            # convert to [["1", index], ...]
             nested = [[str(val), i] for i, val in enumerate(ids)]
             return json.dumps(nested)
-
         else:
             raise ValueError(f"Unknown return_type: {return_type}")
 
     else:
-        # single value
-        cursor.execute(
-            f"SELECT {target_column} FROM {lookup_table} WHERE {lookup_column} = %s",
-            (value,)
-        )
-        result = cursor.fetchone()
+        v = str(value).strip()
+        key = (lookup_table, lookup_column, v)
+        if key in FK_CACHE:
+            result = FK_CACHE[key]
+        else:
+            cursor.execute(
+                f"SELECT {target_column} FROM {lookup_table} WHERE {lookup_column} = %s",
+                (v,)
+            )
+            result = cursor.fetchone()
+            FK_CACHE[key] = result
         return result[0] if result else None
 
 
@@ -519,8 +531,17 @@ def handle_json_group(sheet_name, df, cursor, db):
 
 
 def upsert_row(cursor, table, unique_col, row_data):
+    def clean_value(v):
+        # Convert tuple like (1,) → 1
+        if isinstance(v, tuple) and len(v) == 1:
+            return v[0]
+        # Convert list/tuple to JSON string
+        if isinstance(v, (list, tuple)):
+            return json.dumps(v)
+        return v
+
     cols = list(row_data.keys())
-    values = list(row_data.values())
+    values = [clean_value(v) for v in row_data.values()]
 
     # Check if record exists
     cursor.execute(
@@ -553,6 +574,12 @@ def import_sheet(sheet_name, df, cursor, db):
 
     # Expand rows based on repeat_logic if defined
     df = expand_repeat_rows(df, mapping, cursor)
+
+    # Remove repeat_logic helper column (e.g., flights_repeat) from insert
+    if "repeat_logic" in mapping:
+        trigger_col = mapping["repeat_logic"]["trigger_column"]
+        if trigger_col in df.columns:
+            df.drop(columns=[trigger_col], inplace=True, errors="ignore")
 
     # Convert int/flag columns
     if table in INT_COLUMNS:
@@ -639,18 +666,28 @@ def import_sheet(sheet_name, df, cursor, db):
 
     # 4️ Upsert rows
     unique_col = UNIQUE_KEYS.get(table)
-    for _, row in df.iterrows():
+    total_rows = len(df)
+    for i, row in enumerate(df.iterrows()):
+        _, row = row
         row_data = {col: row[col] for col in df.columns}
+
+        # Progress feedback
+        if i % 50 == 0:
+            print(f"  → Processing {table} row {i}/{total_rows}")
+
         if unique_col:
             upsert_row(cursor, table, unique_col, row_data)
         else:
-            # fallback: pure insert if no unique key defined
             cols = list(row_data.keys())
             vals = list(row_data.values())
             col_names = ", ".join([f"`{c}`" for c in cols])
             placeholders = ", ".join(["%s"] * len(cols))
             sql = f"INSERT INTO {table} ({col_names}) VALUES ({placeholders})"
             cursor.execute(sql, vals)
+
+        # Commit in chunks to avoid buffer buildup
+        if i % 100 == 0:
+            db.commit()
 
     db.commit()
     print(f"Inserted {len(df)} rows into {table} table")
@@ -674,7 +711,7 @@ def load_excel_sheets(file_path):
         for col in df.columns:
             df[col] = df[col].map(
                 lambda x: None if pd.isna(x) or str(x).strip().lower() in (
-                'nan', 'none', '') else x
+                    'nan', 'none', '') else x
             )
 
         # Only include if the sheet has any data left
@@ -689,7 +726,7 @@ def load_excel_sheets(file_path):
 # ----------------------------
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python import_excel.py <excel_file_path>")
+        print("Usage: python tour_data.py <excel_file_path>")
         sys.exit(1)
 
     excel_path = sys.argv[1]
